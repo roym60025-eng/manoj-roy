@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">Smart PDF Maker</string>
+    <string name="nav_home">Home</string>
+    <string name="nav_files">Files</string>
+    <string name="nav_create">Create PDF</string>
+    <string name="welcome_title">Welcome to Smart PDF Maker</string>
+    <string name="welcome_subtitle">Create, scan, convert, compress, and organize PDFs privately on your device.</string>
+</resources>

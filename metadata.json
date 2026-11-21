@@ -1,0 +1,6 @@
+{
+  "name": "Smart PDF Maker",
+  "description": "Create, scan, convert, compress, merge, and manage PDFs locally on your device.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
