@@ -278,14 +278,19 @@ class SmartPdfViewModel(application: Application) : AndroidViewModel(application
     // Image to PDF
     fun addImages(uris: List<Uri>) {
         if (uris.isEmpty()) return
-        val newItems = uris.map { uri ->
-            SelectedImageItem(
-                uri = uri,
-                displayName = engine.resolveDisplayName(uri, "Image")
-            )
-        }
-        _imageToPdfState.update {
-            it.copy(selectedImages = it.selectedImages + newItems, resultRecord = null)
+        viewModelScope.launch {
+            val newItems = uris.map { uri ->
+                val name = engine.resolveDisplayName(uri, "Image")
+                val cachedPath = engine.cachePickedImageUri(uri)
+                SelectedImageItem(
+                    uri = uri,
+                    displayName = name,
+                    localCachePath = cachedPath
+                )
+            }
+            _imageToPdfState.update {
+                it.copy(selectedImages = it.selectedImages + newItems, resultRecord = null)
+            }
         }
     }
 
@@ -339,7 +344,7 @@ class SmartPdfViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             _imageToPdfState.update { it.copy(isProcessing = true, resultRecord = null) }
             engine.imagesToPdf(
-                imageUris = snapshot.selectedImages.map { it.uri },
+                images = snapshot.selectedImages,
                 pageSize = snapshot.pageSize,
                 customWidthPt = snapshot.customWidthPt,
                 customHeightPt = snapshot.customHeightPt,

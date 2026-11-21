@@ -7,6 +7,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
+import android.graphics.ImageDecoder
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
@@ -16,6 +17,7 @@ import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.media.ExifInterface
 import android.net.Uri
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import android.text.Layout
@@ -37,6 +39,7 @@ import com.example.data.model.PdfToolId
 import com.example.data.model.PdfToJpgResult
 import com.example.data.model.ScanFilter
 import com.example.data.model.ScannedPageItem
+import com.example.data.model.SelectedImageItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.xmlpull.v1.XmlPullParser
@@ -69,8 +72,20 @@ class PdfProcessingEngine(
         return uri.lastPathSegment?.substringAfterLast('/') ?: fallback
     }
 
+    suspend fun cachePickedImageUri(uri: Uri): String? = withContext(Dispatchers.IO) {
+        runCatching {
+            val pickedDir = File(context.cacheDir, "picked_images").apply { if (!exists()) mkdirs() }
+            val outFile = File(pickedDir, "img_${System.nanoTime()}.bin")
+            copyUriToFile(uri, outFile)
+            if (outFile.length() > 0L) outFile.absolutePath else {
+                outFile.delete()
+                null
+            }
+        }.getOrNull()
+    }
+
     suspend fun imagesToPdf(
-        imageUris: List<Uri>,
+        images: List<SelectedImageItem>,
         pageSize: PageSizeOption,
         customWidthPt: Int,
         customHeightPt: Int,
@@ -80,7 +95,7 @@ class PdfProcessingEngine(
         outputName: String
     ): Result<PdfFileRecord> = withContext(Dispatchers.IO) {
         runCatching {
-            require(imageUris.isNotEmpty()) { "Please select at least one image." }
+            require(images.isNotEmpty()) { "Please select at least one image." }
 
             val baseW = if (pageSize == PageSizeOption.CUSTOM) customWidthPt.coerceIn(200, 2000) else pageSize.widthPt
             val baseH = if (pageSize == PageSizeOption.CUSTOM) customHeightPt.coerceIn(200, 2000) else pageSize.heightPt
@@ -96,10 +111,13 @@ class PdfProcessingEngine(
             var renderedCount = 0
 
             try {
-                imageUris.forEachIndexed { index, uri ->
-                    val decoded = decodeSampledBitmap(uri, maxDimension = 1800)
-                        ?: error("Unsupported or unreadable image at item ${index + 1}.")
-                    val compressedBitmap = recompressBitmap(decoded, quality)
+                images.forEachIndexed { index, item ->
+                    val decoded = decodeBitmapFromSource(
+                        uri = item.uri,
+                        localPath = item.localCachePath,
+                        maxDimension = 1800
+                    ) ?: error("Could not decode image ${index + 1} (${item.displayName}).")
+                    val compressedBitmap = ensureSoftwareArgbBitmap(recompressBitmap(decoded, quality))
                     if (compressedBitmap !== decoded) decoded.recycle()
 
                     val pageInfo = PdfDocument.PageInfo.Builder(pageW, pageH, index + 1).create()
@@ -149,8 +167,8 @@ class PdfProcessingEngine(
 
     suspend fun copyUriToTempScanImage(uri: Uri): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            val bitmap = decodeSampledBitmap(uri, maxDimension = 1800)
-                ?: error("Could not read image. Please choose a JPG, PNG, or WEBP file.")
+            val bitmap = decodeBitmapFromSource(uri = uri, localPath = null, maxDimension = 1800)
+                ?: error("Could not read image. Please choose a JPG, PNG, WEBP, or HEIC photo.")
             val scansDir = File(context.cacheDir, "scans").apply { if (!exists()) mkdirs() }
             val outFile = File(scansDir, "scan_${System.currentTimeMillis()}.jpg")
             FileOutputStream(outFile).use { out ->
@@ -247,19 +265,21 @@ class PdfProcessingEngine(
     suspend fun inspectPdfUri(uri: Uri): Result<PdfDocumentCandidate> = withContext(Dispatchers.IO) {
         runCatching {
             val displayName = resolveDisplayName(uri, "Imported.pdf")
-            val tempFile = File.createTempFile("inspect_", ".pdf", context.cacheDir)
+            val pickedPdfDir = File(context.cacheDir, "picked_pdfs").apply { if (!exists()) mkdirs() }
+            val cachedFile = File(pickedPdfDir, "pdf_${System.nanoTime()}.pdf")
             try {
-                copyUriToFile(uri, tempFile)
-                val pages = countPdfPagesOrThrow(tempFile)
+                copyUriToFile(uri, cachedFile)
+                val pages = countPdfPagesOrThrow(cachedFile)
                 PdfDocumentCandidate(
                     uri = uri,
-                    localFilePath = null,
+                    localFilePath = cachedFile.absolutePath,
                     displayName = displayName,
-                    sizeBytes = tempFile.length(),
+                    sizeBytes = cachedFile.length(),
                     pageCount = pages
                 )
-            } finally {
-                tempFile.delete()
+            } catch (t: Throwable) {
+                cachedFile.delete()
+                throw t
             }
         }
     }
@@ -693,16 +713,19 @@ class PdfProcessingEngine(
     }
 
     private fun copyUriToFile(uri: Uri, target: File) {
-        context.contentResolver.openInputStream(uri)?.use { input ->
+        val stream = context.contentResolver.openInputStream(uri)
+            ?: context.contentResolver.openAssetFileDescriptor(uri, "r")?.createInputStream()
+        stream?.use { input ->
             FileOutputStream(target).use { output -> input.copyTo(output) }
         } ?: error("Unable to read selected file.")
     }
 
     private fun countPdfPagesOrThrow(file: File): Int {
         if (file.length() < 8) error("Selected file is empty or invalid.")
-        val header = ByteArray(5)
-        file.inputStream().use { it.read(header) }
-        if (String(header) != "%PDF-") {
+        val headerBuf = ByteArray(1024)
+        val readCount = file.inputStream().use { it.read(headerBuf) }
+        val headerStr = if (readCount > 0) String(headerBuf, 0, readCount, Charsets.ISO_8859_1) else ""
+        if (!headerStr.contains("%PDF-")) {
             error("Invalid PDF file format.")
         }
         return try {
@@ -816,33 +839,100 @@ class PdfProcessingEngine(
         return result
     }
 
-    private fun decodeSampledBitmap(uri: Uri, maxDimension: Int): Bitmap? {
-        val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        context.contentResolver.openInputStream(uri)?.use {
-            BitmapFactory.decodeStream(it, null, boundsOpts)
-        } ?: return null
-
-        if (boundsOpts.outWidth <= 0 || boundsOpts.outHeight <= 0) return null
-        var sampleSize = 1
-        while (boundsOpts.outWidth / sampleSize > maxDimension || boundsOpts.outHeight / sampleSize > maxDimension) {
-            sampleSize *= 2
+    private fun decodeBitmapFromSource(
+        uri: Uri?,
+        localPath: String?,
+        maxDimension: Int
+    ): Bitmap? {
+        val existingLocal = localPath?.let(::File)?.takeIf { it.exists() && it.length() > 0L }
+        var tempFile: File? = null
+        val sourceFile = existingLocal ?: run {
+            if (uri == null) return null
+            val created = File.createTempFile("decode_img_", ".bin", context.cacheDir)
+            try {
+                copyUriToFile(uri, created)
+                if (created.length() <= 0L) {
+                    created.delete()
+                    return null
+                }
+                tempFile = created
+                created
+            } catch (_: Throwable) {
+                created.delete()
+                null
+            }
         }
 
-        val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-        val decoded = context.contentResolver.openInputStream(uri)?.use {
-            BitmapFactory.decodeStream(it, null, decodeOpts)
-        } ?: return null
+        try {
+            if (sourceFile != null) {
+                // 1. Android 9+ ImageDecoder handles JPG, PNG, WEBP, HEIC, AVIF, and EXIF rotation automatically
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    val decoded = runCatching {
+                        val source = ImageDecoder.createSource(sourceFile)
+                        ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                            val w = info.size.width
+                            val h = info.size.height
+                            if (w > maxDimension || h > maxDimension) {
+                                val scale = maxDimension.toFloat() / max(w, h).coerceAtLeast(1)
+                                decoder.setTargetSize(
+                                    (w * scale).roundToInt().coerceAtLeast(1),
+                                    (h * scale).roundToInt().coerceAtLeast(1)
+                                )
+                            }
+                        }
+                    }.getOrNull()
+                    if (decoded != null) return ensureSoftwareArgbBitmap(decoded)
+                }
 
-        val orientation = context.contentResolver.openInputStream(uri)?.use { stream ->
-            runCatching {
-                ExifInterface(stream).getAttributeInt(
-                    ExifInterface.TAG_ORIENTATION,
-                    ExifInterface.ORIENTATION_NORMAL
-                )
-            }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
-        } ?: ExifInterface.ORIENTATION_NORMAL
+                // 2. Fallback to BitmapFactory + ExifInterface on the seekable local file
+                val fileBmp = decodeSampledFileBitmap(sourceFile, maxDimension)
+                if (fileBmp != null) {
+                    val orientation = runCatching {
+                        ExifInterface(sourceFile.absolutePath).getAttributeInt(
+                            ExifInterface.TAG_ORIENTATION,
+                            ExifInterface.ORIENTATION_NORMAL
+                        )
+                    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+                    return ensureSoftwareArgbBitmap(applyExifOrientation(fileBmp, orientation))
+                }
+            }
 
-        return applyExifOrientation(decoded, orientation)
+            // 3. Final fallback: ImageDecoder directly from ContentResolver (API 28+)
+            if (uri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val decoded = runCatching {
+                    val source = ImageDecoder.createSource(context.contentResolver, uri)
+                    ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                        decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                        val w = info.size.width
+                        val h = info.size.height
+                        if (w > maxDimension || h > maxDimension) {
+                            val scale = maxDimension.toFloat() / max(w, h).coerceAtLeast(1)
+                            decoder.setTargetSize(
+                                (w * scale).roundToInt().coerceAtLeast(1),
+                                (h * scale).roundToInt().coerceAtLeast(1)
+                            )
+                        }
+                    }
+                }.getOrNull()
+                if (decoded != null) return ensureSoftwareArgbBitmap(decoded)
+            }
+            return null
+        } finally {
+            tempFile?.delete()
+        }
+    }
+
+    private fun ensureSoftwareArgbBitmap(bitmap: Bitmap): Bitmap {
+        val isHardware = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            bitmap.config == Bitmap.Config.HARDWARE
+        if (!isHardware && bitmap.config == Bitmap.Config.ARGB_8888) return bitmap
+        val copy = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        if (copy != null && copy !== bitmap) {
+            bitmap.recycle()
+            return copy
+        }
+        return bitmap
     }
 
     private fun decodeSampledFileBitmap(file: File, maxDimension: Int): Bitmap? {
@@ -875,8 +965,18 @@ class PdfProcessingEngine(
     }
 
     private fun recompressBitmap(source: Bitmap, quality: Int): Bitmap {
+        val flattened = if (source.hasAlpha()) {
+            val whiteBg = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
+            val c = Canvas(whiteBg)
+            c.drawColor(Color.WHITE)
+            c.drawBitmap(source, 0f, 0f, null)
+            whiteBg
+        } else {
+            source
+        }
         val baos = ByteArrayOutputStream()
-        source.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+        flattened.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+        if (flattened !== source) flattened.recycle()
         val bytes = baos.toByteArray()
         return BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: source
     }

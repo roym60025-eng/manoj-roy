@@ -63,7 +63,8 @@ data class PdfFileRecord(
 data class SelectedImageItem(
     val id: String = UUID.randomUUID().toString(),
     val uri: Uri,
-    val displayName: String
+    val displayName: String,
+    val localCachePath: String? = null
 )
 
 data class ScannedPageItem(

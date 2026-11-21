@@ -291,7 +291,7 @@ fun ImageToPdfScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             AsyncImage(
-                                model = item.uri,
+                                model = item.localCachePath?.let(::File) ?: item.uri,
                                 contentDescription = item.displayName,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier
